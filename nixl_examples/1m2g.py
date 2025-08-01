@@ -1,39 +1,38 @@
+import os
 import torch
 import torch.nn as nn
-import nixl  # Need to import Nixl first
+import nixl
 
-# Ensure using 2 GPUs
-assert torch.cuda.device_count() >= 2
+# 環境變數設定（可選，開啟 debug/profiling）
+os.environ["NIXL_LOG_LEVEL"] = "debug"
+os.environ["NIXL_PROFILING"] = "1"
 
-# Step 1: Create Expert (deployed on GPU 1)
+# ✅ 初始化 Nixl（僅限單機）
+nixl.init()
+
+# === 定義 Expert 模型，部署在 GPU_1 ===
 class Expert(nn.Module):
-    def __init__(self, d_model):
+    def __init__(self, dim):
         super().__init__()
-        self.fc = nn.Linear(d_model, d_model).cuda(1)  # Expert placed on GPU 1
+        self.fc = nn.Linear(dim, dim).cuda(1)  # Expert 在 GPU 1
 
     def forward(self, x):
         return self.fc(x)
 
-# Step 2: Enable Nixl and establish channel
-torch.distributed.init_process_group("nccl", init_method="env://", rank=0, world_size=1)
+# === 模擬 token ===
+batch_size, dim = 32, 768
+tokens = torch.randn(batch_size, dim, device="cuda:0")  # tokens on GPU_0
 
-nixl.init()
-nixl.set_default_device(torch.device("cuda:0"))  # Nixl routing entry on GPU_0
-
-# Simulate token embeddings: placed on GPU 0
-batch_size, d_model = 32, 768
-tokens = torch.randn(batch_size, d_model, device="cuda:0")
-
-# Step 3: Use Nixl routing to Expert (GPU_1)
-expert = Expert(d_model)
-
-# Wrap expert as Nixl module
+# === 包裝 Expert，設定 remote routing ===
+expert = Expert(dim)
 routed_expert = nixl.RemoteModule.from_module(expert, device=torch.device("cuda:1"))
 
-# Step 4: Routing + Inference
-output = routed_expert(tokens)  # GPU_0 → GPU_1 → result returns to GPU_0
+# === Routing: GPU_0 → GPU_1 expert → return to GPU_0 ===
+output = routed_expert(tokens)
 
-print("Output shape:", output.shape)  # Confirm routing success
+# === 驗證輸出正確性 ===
+print(f"Output shape: {output.shape}")  # (32, 768)
+print(f"Output device: {output.device}")  # should be cuda:0
 
-# Step 5: Shutdown Nixl
+# === 結束 Nixl 系統 ===
 nixl.shutdown()
