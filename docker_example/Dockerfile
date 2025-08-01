@@ -1,10 +1,22 @@
 FROM python:3.10-slim
 
-# Install NumPy
+# Install dependencies
 RUN pip install numpy
 
-# Create directory for mounting
+# Set working directory
 WORKDIR /app
 
-# Default entrypoint
-ENTRYPOINT ["/app/start.sh"]
+# Add entrypoint wrapper script
+RUN echo '#!/bin/bash\n' \
+         'echo "==> Listing /app contents:"\n' \
+         'ls -alh /app\n' \
+         'echo ""\n' \
+         'if [[ ! -x "/app/start.sh" ]]; then\n' \
+         '  echo "❌ ERROR: start.sh not found or not executable in /app!" >&2\n' \
+         '  exit 1\n' \
+         'fi\n' \
+         'echo "🚀 Launching /app/start.sh..."\n' \
+         '/app/start.sh' > /entrypoint.sh && chmod +x /entrypoint.sh
+
+# Set custom entrypoint
+ENTRYPOINT ["/entrypoint.sh"]
