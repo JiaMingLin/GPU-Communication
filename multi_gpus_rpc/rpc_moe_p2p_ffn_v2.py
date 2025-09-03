@@ -429,8 +429,6 @@ if __name__ == "__main__":
 
 
 """
-python rpc_moe_ffn.py --workers 4 \
-  --tokens 4096 --d-model 1024 --d-hidden 4096 \
-  --gate round_robin \
-  --verify gpu
+python rpc_moe_p2p_ffn_v2.py --workers 4 --tokens 4096 \
+  --d-model 1024 --d-hidden 4096 --gate random --verify coord_gpu
 """
