@@ -152,16 +152,11 @@ def coordinator_main(args, world_size: int):
     except Exception:
         pass
 
-    # CUDA-IPC device maps: pairwise among all peers
-    for src_rank in range(world_size):
-        src_name = "coordinator" if src_rank == 0 else f"worker{src_rank}"
-        for dst_rank in range(1, world_size):
-            if src_rank == dst_rank: continue
-            dst_name = f"worker{dst_rank}"
-            if src_rank == 0:
-                opts.set_device_map(dst_name, {args.coordinator_gpu: dst_rank-1})
-            else:
-                opts.set_device_map(dst_name, {src_rank-1: dst_rank-1})
+    # Device maps (coordinator → each worker). Coordinator should ONLY set maps for itself.
+    for dst_rank in range(1, world_size):
+        dst_name = f"worker{dst_rank}"
+        # map coordinator's local GPU -> dst worker's GPU
+        opts.set_device_map(dst_name, {args.coordinator_gpu: dst_rank-1})
 
     rpc.init_rpc(name="coordinator", rank=0, world_size=world_size, rpc_backend_options=opts)
 
@@ -301,7 +296,7 @@ def worker_main(args, rank: int, world_size: int):
         if dst_rank == rank: continue
         opts.set_device_map(f"worker{dst_rank}", {rank-1: dst_rank-1})
     # Optional mapping to coordinator GPU 0 (not strictly needed here)
-    opts.set_device_map("coordinator", {rank-1: 0})
+    opts.set_device_map("coordinator", {rank-1: args.coordinator_gpu})
 
     rpc.init_rpc(name=name, rank=rank, world_size=world_size, rpc_backend_options=opts)
 
