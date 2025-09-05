@@ -61,6 +61,7 @@ class ExpertWorker:
         self.X_local = None           # tokens originated here (GPU)
         self.inbox: List[torch.Tensor] = []  # received CUDA chunks
         self._pending_sends: List[rpc.Future] = []
+        self._keep_idx: torch.Tensor | None = None
 
     # ----- Model init -----
     @torch.no_grad()
@@ -77,13 +78,30 @@ class ExpertWorker:
         self.X_local = torch.randn(num_tokens, d_model, device=self.device, generator=g)
         self.inbox = []
         self._pending_sends = []
+        self._keep_idx = None
         return (num_tokens, d_model)
+
+    # ----- Local keep / finalize (to avoid self-sends & duplicates) -----
+    @torch.no_grad()
+    def set_local_keep(self, idx_keep: torch.Tensor) -> int:
+        self._keep_idx = idx_keep.to(self.device, non_blocking=True) if idx_keep.numel() > 0 else torch.empty(0, dtype=torch.long, device=self.device)
+        return int(self._keep_idx.numel())
+
+    @torch.no_grad()
+    def finalize_local(self) -> int:
+        if self._keep_idx is not None:
+            self.X_local = self.X_local.index_select(0, self._keep_idx)
+            kept = int(self.X_local.shape[0])
+            self._keep_idx = None
+            return kept
+        return int(self.X_local.shape[0])
 
     # ----- P2P phase -----
     @torch.no_grad()
     def p2p_send(self, dest_worker: str, idx: torch.Tensor) -> int:
-        if idx.numel() == 0:
-            return 0
+        # Skip self-send (tokens to be kept will be handled by finalize_local)
+        if dest_worker == self.name or idx.numel() == 0:
+            return int(idx.numel())
         idx = idx.to(self.device, non_blocking=True)
         chunk = self.X_local.index_select(0, idx)
         fut = rpc.rpc_async(dest_worker, ExpertWorker.recv_tokens, args=(chunk,))
@@ -215,12 +233,21 @@ def coordinator_main(args, world_size: int):
     # Phase 1: P2P sends
     t3 = time.perf_counter()
     send_futs = []
+    # Set local keep (self assignment) and send to others
     for (src_name, _, rref), plan in zip(workers, plans):
+        # apply keep for self-assigned tokens
+        self_idx = plan.get(src_name, torch.empty(0, dtype=torch.long))
+        _remote_method(ExpertWorker.set_local_keep, rref, self_idx)
         for dst_name, idx in plan.items():
+            if dst_name == src_name:
+                continue  # avoid self-sends; handled by finalize_local
             send_futs.append(_remote_method(ExpertWorker.p2p_send, rref, dst_name, idx))
     for f in send_futs: f.wait()
     wait_futs = [_remote_method(ExpertWorker.p2p_wait, rref) for _, _, rref in workers]
     for f in wait_futs: f.wait()
+    # finalize locals after all sends received
+    fin_futs = [_remote_method(ExpertWorker.finalize_local, rref) for _, _, rref in workers]
+    for f in fin_futs: f.wait()
     t_p2p = time.perf_counter() - t3
 
     # Phase 2: Compute
