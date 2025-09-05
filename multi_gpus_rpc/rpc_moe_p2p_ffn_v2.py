@@ -1,47 +1,33 @@
 #!/usr/bin/env python3
 """
-Single-node Multi-GPU demos with PyTorch RPC.
+Single-node MoE Layer (P2P) with Coordinator-side Verification
 
-Tasks
-- matmul  : parallel C = A @ B with row-splitting (baseline from earlier)
-- moe_ffn : coordinator routes tokens to per-worker FFN experts; workers run FFN forward
+Changes vs. v1:
+- Tokens are initialized on EACH worker's GPU (no coordinator token shipping).
+- Phase 1: true worker→worker P2P token transfer via RPC (CUDA-IPC).
+- Phase 2: each worker runs its FFN locally on its final token set.
+- **Verification on coordinator**: coordinator pulls back each worker's final tokens (CPU) and recomputes
+  outputs using the expert params it originally generated; supports:
+    --verify {none, coord_gpu, coord_cpu1}
 
-Topology
-- 1 coordinator process (rank 0)
-- N worker processes (ranks 1..N), each pinned to a distinct CUDA device
-
-Highlights
-- Uses TensorPipe RPC with CUDA-IPC for GPU↔GPU tensor transfer on a single node
-- Parallelism: all worker RPCs launched with rpc_async and gathered with futures
-- Verification switch: --verify {none,gpu,cpu1}
-
-Run examples
-  # MoE-FFN (default task), 3 workers
-  python rpc_matmul_multi_gpu.py --workers 3 --tokens 4096 --d-model 1024 --d-hidden 4096 --verify gpu
-
-  # Matmul demo, 2 workers
-  python rpc_matmul_multi_gpu.py --task matmul --workers 2 --m 4096 --k 4096 --n 4096 --verify gpu
-
-Notes
-- Ensure you have ≥ workers GPUs visible, e.g. CUDA_VISIBLE_DEVICES=0,1,2
-- For multi-node in the future: change --init to a rendezvous address; set device_maps both ways.
+Run
+  CUDA_VISIBLE_DEVICES=0,1,2 \
+  python rpc_moe_p2p_ffn_v2.py --workers 3 --tokens 4096 \
+    --d-model 1024 --d-hidden 4096 --gate random --verify coord_gpu
 """
 
 from __future__ import annotations
 import argparse
-import os
 import time
 import threading
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 import torch.multiprocessing as mp
 import torch.distributed.rpc as rpc
 from torch.distributed.rpc import TensorPipeRpcBackendOptions
 
-# ----------------------------
-# RPC helpers
-# ----------------------------
+# ---------------- RPC helpers ----------------
 
 def _call_method(method, rref, *args, **kwargs):
     return method(rref.local_value(), *args, **kwargs)
@@ -51,46 +37,34 @@ def _remote_method(method, rref, *args, **kwargs):
     return rpc.rpc_async(rref.owner(), _call_method, args=(method, rref) + args, kwargs=kwargs)
 
 
-# ----------------------------
-# Worker types
-# ----------------------------
-
+# --------------- Global stop -----------------
 _STOP_EVENT: threading.Event | None = None
 
 
-class MatMulWorker:
-    def __init__(self, device_index: int):
-        self.device = torch.device(f"cuda:{device_index}")
-        torch.cuda.set_device(self.device)
-        self.cached_B = None  # (K, N) on GPU
-
-    @torch.no_grad()
-    def cache_B(self, B: torch.Tensor) -> bool:
-        assert B.is_cuda, "B must be CUDA tensor for fast GPU→GPU transfer"
-        self.cached_B = B.to(self.device, non_blocking=True)
-        return True
-
-    @torch.no_grad()
-    def matmul_rows(self, A_rows: torch.Tensor) -> torch.Tensor:
-        assert self.cached_B is not None, "B is not cached yet; call cache_B first"
-        A_rows = A_rows.to(self.device, non_blocking=True)
-        C_rows = torch.matmul(A_rows, self.cached_B)
-        return C_rows.cpu()
+def _signal_stop():
+    global _STOP_EVENT
+    if _STOP_EVENT is not None:
+        _STOP_EVENT.set()
+    return True
 
 
+# --------------- Expert worker ---------------
 class ExpertWorker:
-    """Holds one FFN expert on a single GPU and serves RPC calls."""
-    def __init__(self, device_index: int):
+    """One FFN expert + P2P inbox/outbox on a single GPU."""
+    def __init__(self, device_index: int, name: str):
+        self.name = name
         self.device = torch.device(f"cuda:{device_index}")
         torch.cuda.set_device(self.device)
-        self.W1 = None
-        self.b1 = None
-        self.W2 = None
-        self.b2 = None
+        # Expert params
+        self.W1 = None; self.b1 = None; self.W2 = None; self.b2 = None
+        # Token buffers
+        self.X_local = None           # tokens originated here (GPU)
+        self.inbox: List[torch.Tensor] = []  # received CUDA chunks
+        self._pending_sends: List[rpc.Future] = []
 
+    # ----- Model init -----
     @torch.no_grad()
-    def set_ffn_params(self, W1: torch.Tensor, b1: torch.Tensor,
-                        W2: torch.Tensor, b2: torch.Tensor) -> bool:
+    def set_ffn_params(self, W1: torch.Tensor, b1: torch.Tensor, W2: torch.Tensor, b2: torch.Tensor) -> bool:
         self.W1 = W1.to(self.device, non_blocking=True)
         self.b1 = b1.to(self.device, non_blocking=True)
         self.W2 = W2.to(self.device, non_blocking=True)
@@ -98,48 +72,77 @@ class ExpertWorker:
         return True
 
     @torch.no_grad()
-    def ffn_forward(self, X: torch.Tensor) -> torch.Tensor:
-        """X: (N_tok, d_model) on coordinator GPU -> returns CPU tensor"""
-        assert self.W1 is not None, "FFN not initialized"
-        X = X.to(self.device, non_blocking=True)
-        H = torch.matmul(X, self.W1) + self.b1
+    def init_tokens(self, num_tokens: int, d_model: int, seed: int = 0) -> Tuple[int, int]:
+        g = torch.Generator(device=self.device); g.manual_seed(seed)
+        self.X_local = torch.randn(num_tokens, d_model, device=self.device, generator=g)
+        self.inbox = []
+        self._pending_sends = []
+        return (num_tokens, d_model)
+
+    # ----- P2P phase -----
+    @torch.no_grad()
+    def p2p_send(self, dest_worker: str, idx: torch.Tensor) -> int:
+        if idx.numel() == 0:
+            return 0
+        idx = idx.to(self.device, non_blocking=True)
+        chunk = self.X_local.index_select(0, idx)
+        fut = rpc.rpc_async(dest_worker, ExpertWorker.recv_tokens, args=(chunk,))
+        self._pending_sends.append(fut)
+        return int(chunk.shape[0])
+
+    @torch.no_grad()
+    def p2p_wait(self) -> int:
+        done = 0
+        for f in self._pending_sends:
+            f.wait(); done += 1
+        self._pending_sends.clear()
+        return done
+
+    @staticmethod
+    @torch.no_grad()
+    def recv_tokens(chunk: torch.Tensor) -> int:
+        inst = _WORKER_SINGLETON.get()
+        assert inst is not None, "Worker instance not registered"
+        chunk = chunk.to(inst.device, non_blocking=True)
+        inst.inbox.append(chunk)
+        return int(chunk.shape[0])
+
+    # ----- Compute phase -----
+    @torch.no_grad()
+    def run_ffn(self) -> Tuple[torch.Tensor, Dict[str, int]]:
+        assert self.W1 is not None and self.X_local is not None
+        if self.inbox:
+            X_all = torch.cat([self.X_local] + self.inbox, dim=0)
+        else:
+            X_all = self.X_local
+        H = X_all @ self.W1 + self.b1
         H = torch.nn.functional.gelu(H)
-        Y = torch.matmul(H, self.W2) + self.b2
-        return Y.cpu()
+        Y = H @ self.W2 + self.b2
+        stats = {"local": int(self.X_local.shape[0]),
+                 "received": int(sum(x.shape[0] for x in self.inbox)),
+                 "total": int(X_all.shape[0])}
+        return Y.cpu(), stats
+
+    # ----- Export tokens for coordinator verification -----
+    @torch.no_grad()
+    def export_tokens_cpu(self) -> torch.Tensor:
+        if self.inbox:
+            X_all = torch.cat([self.X_local] + self.inbox, dim=0)
+        else:
+            X_all = self.X_local
+        return X_all.detach().to("cpu")
 
 
-def _signal_stop():  # called via rpc from coordinator
-    global _STOP_EVENT
-    if _STOP_EVENT is not None:
-        _STOP_EVENT.set()
-    return True
+# registry for static recv
+class _WorkerRegistry:
+    def __init__(self): self.inst: ExpertWorker | None = None
+    def set(self, inst: ExpertWorker): self.inst = inst
+    def get(self) -> ExpertWorker | None: return self.inst
+
+_WORKER_SINGLETON = _WorkerRegistry()
 
 
-# ----------------------------
-# CPU single-thread reference for verification
-# ----------------------------
-
-_prev_torch_threads: int | None = None
-
-
-def _cpu_single_thread_mm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-    """Compute A@B on CPU with a single thread (reference)."""
-    global _prev_torch_threads
-    A_cpu = A.detach().to("cpu", dtype=torch.float32)
-    B_cpu = B.detach().to("cpu", dtype=torch.float32)
-    _prev_torch_threads = torch.get_num_threads()
-    try:
-        torch.set_num_threads(1)
-        C_cpu = A_cpu @ B_cpu
-    finally:
-        if _prev_torch_threads is not None:
-            torch.set_num_threads(_prev_torch_threads)
-    return C_cpu
-
-
-# ----------------------------
-# Coordinator logic
-# ----------------------------
+# ---------------- Coordinator ---------------
 
 def coordinator_main(args, world_size: int):
     opts = TensorPipeRpcBackendOptions(num_worker_threads=args.rpc_threads, init_method=args.init)
@@ -149,208 +152,137 @@ def coordinator_main(args, world_size: int):
     except Exception:
         pass
 
-    # Map coordinator GPU -> worker GPU for each peer (for CUDA tensor sends)
-    for rank in range(1, world_size):
-        worker_name = f"worker{rank}"
-        worker_gpu = rank - 1
-        opts.set_device_map(worker_name, {args.coordinator_gpu: worker_gpu})
+    # CUDA-IPC device maps: pairwise among all peers
+    for src_rank in range(world_size):
+        src_name = "coordinator" if src_rank == 0 else f"worker{src_rank}"
+        for dst_rank in range(1, world_size):
+            if src_rank == dst_rank: continue
+            dst_name = f"worker{dst_rank}"
+            if src_rank == 0:
+                opts.set_device_map(dst_name, {args.coordinator_gpu: dst_rank-1})
+            else:
+                opts.set_device_map(dst_name, {src_rank-1: dst_rank-1})
 
-    rpc.init_rpc(
-        name="coordinator",
-        rank=0,
-        world_size=world_size,
-        rpc_backend_options=opts,
-    )
+    rpc.init_rpc(name="coordinator", rank=0, world_size=world_size, rpc_backend_options=opts)
 
-    # Create remote worker modules (one per worker)
+    # Create workers
     workers = []
     for rank in range(1, world_size):
-        worker_name = f"worker{rank}"
-        worker_gpu = rank - 1
-        if args.task == "matmul":
-            rref = rpc.remote(worker_name, MatMulWorker, args=(worker_gpu,))
-        elif args.task == "moe_ffn":
-            rref = rpc.remote(worker_name, ExpertWorker, args=(worker_gpu,))
-        else:
-            raise ValueError("Unsupported task")
-        workers.append((worker_name, worker_gpu, rref))
+        name = f"worker{rank}"; gpu = rank - 1
+        rref = rpc.remote(name, ExpertWorker, args=(gpu, name))
+        workers.append((name, gpu, rref))
 
+    # Params on coordinator GPU, then ship
     device0 = torch.device(f"cuda:{args.coordinator_gpu}")
     torch.cuda.set_device(device0)
     torch.manual_seed(0)
+    d_model, d_hidden = args.d_model, args.d_hidden
 
-    if args.task == "matmul":
-        # ---------- matmul task ----------
-        M, K, N = args.m, args.k, args.n
-        A = torch.randn(M, K, device=device0, dtype=torch.float32)
-        B = torch.randn(K, N, device=device0, dtype=torch.float32)
+    t0 = time.perf_counter()
+    futs = []
+    expert_params = []  # keep copy for verification
+    for _, _, rref in workers:
+        W1 = torch.randn(d_model, d_hidden, device=device0)
+        b1 = torch.randn(d_hidden, device=device0)
+        W2 = torch.randn(d_hidden, d_model, device=device0)
+        b2 = torch.randn(d_model, device=device0)
+        futs.append(_remote_method(ExpertWorker.set_ffn_params, rref, W1, b1, W2, b2))
+        expert_params.append((W1, b1, W2, b2))
+    for f in futs: f.wait()
+    t_params = time.perf_counter() - t0
 
-        # Broadcast B to workers in parallel
-        t0 = time.perf_counter()
-        futs = [_remote_method(MatMulWorker.cache_B, rref, B) for _, _, rref in workers]
-        for f in futs: f.wait()
-        t_bcast = time.perf_counter() - t0
+    # Init tokens locally
+    t1 = time.perf_counter()
+    futs = []
+    for i, (_, _, rref) in enumerate(workers):
+        futs.append(_remote_method(ExpertWorker.init_tokens, rref, args.tokens, d_model, 1234 + i))
+    for f in futs: f.wait()
+    t_init = time.perf_counter() - t1
 
-        # Split A rows and launch
-        t1 = time.perf_counter()
-        row_splits = _split_rows(M, len(workers))
-        result_futs: List[Tuple[slice, rpc.Future]] = []
-        for (worker_name, _, rref), rows in zip(workers, row_splits):
-            i, j = rows
-            fut = _remote_method(MatMulWorker.matmul_rows, rref, A[i:j, :])
-            result_futs.append((slice(i, j), fut))
-
-        C = torch.empty((M, N), device="cpu", dtype=torch.float32)
-        for rows, fut in result_futs:
-            C_chunk = fut.wait()
-            C[rows, :] = C_chunk
-        t_task = time.perf_counter() - t1
-
-    elif args.task == "moe_ffn":
-        # ---------- MoE FFN task ----------
-        d_model = args.d_model
-        d_hidden = args.d_hidden
-        num_tok = args.tokens
-
-        # Create distinct expert params per worker (on coordinator GPU)
-        expert_params = []
-        for _ in workers:
-            W1 = torch.randn(d_model, d_hidden, device=device0)
-            b1 = torch.randn(d_hidden, device=device0)
-            W2 = torch.randn(d_hidden, d_model, device=device0)
-            b2 = torch.randn(d_model, device=device0)
-            expert_params.append((W1, b1, W2, b2))
-
-        # Ship to workers in parallel
-        t0 = time.perf_counter()
-        futs = []
-        for (_, _, rref), (W1, b1, W2, b2) in zip(workers, expert_params):
-            futs.append(_remote_method(ExpertWorker.set_ffn_params, rref, W1, b1, W2, b2))
-        for f in futs: f.wait()
-        t_bcast = time.perf_counter() - t0
-
-        # Tokens on coordinator
-        X = torch.randn(num_tok, d_model, device=device0)
-
-        # Routing
+    # Routing plans per worker
+    t2 = time.perf_counter()
+    plans: List[Dict[str, torch.Tensor]] = []
+    for i, _ in enumerate(workers):
         if args.gate == "round_robin":
-            assign = torch.arange(num_tok, device=device0) % len(workers)
+            assign = torch.arange(args.tokens) % len(workers)
         elif args.gate == "random":
-            g = torch.Generator(device=device0); g.manual_seed(123)
-            assign = torch.randint(0, len(workers), (num_tok,), device=device0, generator=g)
+            g = torch.Generator(); g.manual_seed(4321 + i)
+            assign = torch.randint(0, len(workers), (args.tokens,), generator=g)
         else:
-            raise ValueError("--gate must be round_robin or random")
+            raise ValueError("gate")
+        plan: Dict[str, torch.Tensor] = {}
+        for w_idx, (dst_name, _, _) in enumerate(workers):
+            idx = torch.nonzero(assign == w_idx, as_tuple=False).flatten().to(torch.int64)
+            plan[dst_name] = idx
+        plans.append(plan)
+    t_plan = time.perf_counter() - t2
 
-        idx_by_w: List[torch.Tensor] = []
-        for w in range(len(workers)):
-            idx = torch.nonzero(assign == w, as_tuple=False).flatten()
-            idx_by_w.append(idx)
+    # Phase 1: P2P sends
+    t3 = time.perf_counter()
+    send_futs = []
+    for (src_name, _, rref), plan in zip(workers, plans):
+        for dst_name, idx in plan.items():
+            send_futs.append(_remote_method(ExpertWorker.p2p_send, rref, dst_name, idx))
+    for f in send_futs: f.wait()
+    wait_futs = [_remote_method(ExpertWorker.p2p_wait, rref) for _, _, rref in workers]
+    for f in wait_futs: f.wait()
+    t_p2p = time.perf_counter() - t3
 
-        # Launch parallel forwards
-        t1 = time.perf_counter()
-        futs2: List[Tuple[torch.Tensor, rpc.Future]] = []
-        for (worker_name, _, rref), idx in zip(workers, idx_by_w):
-            if idx.numel() == 0: continue
-            fut = _remote_method(ExpertWorker.ffn_forward, rref, X.index_select(0, idx))
-            futs2.append((idx.cpu(), fut))
+    # Phase 2: Compute
+    t4 = time.perf_counter()
+    out_futs = [_remote_method(ExpertWorker.run_ffn, rref) for _, _, rref in workers]
+    outs = [f.wait() for f in out_futs]  # list of (Y_cpu, stats)
+    t_compute = time.perf_counter() - t4
 
-        Y = torch.empty_like(X, device="cpu")
-        for idx_cpu, fut in futs2:
-            Y_chunk = fut.wait()
-            Y.index_copy_(0, idx_cpu, Y_chunk)
-        t_task = time.perf_counter() - t1
-
-        # Local reference on GPU for verify=gpu
-        with torch.no_grad():
-            Y_ref_gpu = torch.empty_like(X, device=device0)
-            for w, idx in enumerate(idx_by_w):
-                if idx.numel() == 0: continue
-                Xw = X.index_select(0, idx)
-                W1, b1, W2, b2 = expert_params[w]
-                Hw = torch.matmul(Xw, W1) + b1
-                Hw = torch.nn.functional.gelu(Hw)
-                Yw = torch.matmul(Hw, W2) + b2
-                Y_ref_gpu.index_copy_(0, idx, Yw)
-
-        # Reuse names for verify section
-        C = Y
-        A = None; B = None
-
+    # Verification on coordinator (pull tokens back)
+    if args.verify != "none":
+        v0 = time.perf_counter()
+        # gather X_all per worker to CPU on coordinator
+        x_futs = [_remote_method(ExpertWorker.export_tokens_cpu, rref) for _, _, rref in workers]
+        X_all_cpu_list = [f.wait() for f in x_futs]
+        errs: List[Tuple[str, float]] = []
+        if args.verify == "coord_gpu":
+            for (name, _, _), X_cpu, (Y_cpu, _), (W1, b1, W2, b2) in zip(workers, X_all_cpu_list, outs, expert_params):
+                Xg = X_cpu.to(device0)
+                Y_ref = torch.nn.functional.gelu(Xg @ W1 + b1) @ W2 + b2
+                err = float((Y_ref.detach().to("cpu") - Y_cpu).abs().max().item())
+                errs.append((name, err))
+        elif args.verify == "coord_cpu1":
+            prev = torch.get_num_threads(); torch.set_num_threads(1)
+            try:
+                for (name, _, _), X_cpu, (Y_cpu, _), (W1, b1, W2, b2) in zip(workers, X_all_cpu_list, outs, expert_params):
+                    W1c, b1c = W1.detach().to("cpu"), b1.detach().to("cpu")
+                    W2c, b2c = W2.detach().to("cpu"), b2.detach().to("cpu")
+                    H = X_cpu @ W1c + b1c
+                    H = torch.nn.functional.gelu(H)
+                    Y_ref = H @ W2c + b2c
+                    err = float((Y_ref - Y_cpu).abs().max().item())
+                    errs.append((name, err))
+            finally:
+                torch.set_num_threads(prev)
+        else:
+            raise ValueError("--verify must be: none, coord_gpu, coord_cpu1")
+        t_verify = time.perf_counter() - v0
     else:
-        raise ValueError("Unsupported task")
+        errs = []
+        t_verify = 0.0
 
-    # ---------- Summary & verification ----------
-    print("==== Summary ====")
-    if args.task == "matmul":
-        print(f"Task: matmul | A: {tuple(A.shape)}, B: {tuple(B.shape)}, workers: {len(workers)}")
-    else:
-        print(f"Task: moe_ffn | tokens: {args.tokens}, d_model: {args.d_model}, d_hidden: {args.d_hidden}, workers: {len(workers)}")
-    print(f"Broadcast/Init time: {t_bcast:.3f}s")
-    print(f"Parallel task time: {t_task:.3f}s")
+    # Summary
+    print("==== MoE P2P FFN (Coordinator-Verify) ====")
+    print(f"workers={len(workers)} | tokens/worker={args.tokens} | d_model={d_model} | d_hidden={d_hidden}")
+    print(f"params:{t_params:.3f}s | init:{t_init:.3f}s | plan:{t_plan:.3f}s | p2p:{t_p2p:.3f}s | compute:{t_compute:.3f}s | verify:{t_verify:.3f}s")
+    for (name, _, _), (Y_cpu, stats) in zip(workers, outs):
+        err = next((e for n,e in errs if n==name), None)
+        extra = f" | max_abs_err={err:.3e}" if err is not None else ""
+        print(f"{name}: local={stats['local']} recv={stats['received']} total={stats['total']} out={tuple(Y_cpu.shape)}{extra}")
 
-    if args.verify.lower() != "none":
-        t2 = time.perf_counter()
-        if args.task == "matmul":
-            if args.verify.lower() == "gpu":
-                C_ref = (A @ B).cpu()
-                method = "GPU baseline (coordinator)"
-            elif args.verify.lower() == "cpu1":
-                C_ref = _cpu_single_thread_mm(A, B)
-                method = "CPU single-thread"
-            else:
-                raise ValueError("--verify must be one of: none, gpu, cpu1")
-        else:  # moe_ffn
-            if args.verify.lower() == "gpu":
-                C_ref = Y_ref_gpu.detach().to("cpu")
-                method = "GPU baseline (coordinator)"
-            elif args.verify.lower() == "cpu1":
-                # CPU single-thread FFN reference
-                X_cpu = X.detach().to("cpu")
-                C_ref = torch.empty_like(X_cpu)
-                params_cpu = [(W1.cpu(), b1.cpu(), W2.cpu(), b2.cpu()) for (W1,b1,W2,b2) in expert_params]
-                prev = torch.get_num_threads(); torch.set_num_threads(1)
-                try:
-                    for w, idx in enumerate(idx_by_w):
-                        if idx.numel() == 0: continue
-                        idx_cpu = idx.cpu()
-                        Xw = X_cpu.index_select(0, idx_cpu)
-                        W1, b1, W2, b2 = params_cpu[w]
-                        Hw = Xw @ W1 + b1
-                        Hw = torch.nn.functional.gelu(Hw)
-                        Yw = Hw @ W2 + b2
-                        C_ref.index_copy_(0, idx_cpu, Yw)
-                finally:
-                    torch.set_num_threads(prev)
-                method = "CPU single-thread"
-            else:
-                raise ValueError("--verify must be one of: none, gpu, cpu1")
-        max_abs_err = (C - C_ref).abs().max().item()
-        verify_time = time.perf_counter() - t2
-        print(f"Verify [{method}]: {verify_time:.3f}s, max_abs_err={max_abs_err:.3e}")
-    else:
-        print("Verify: skipped (--verify=none)")
-
-    # Shutdown workers
+    # Shutdown
     for rank in range(1, world_size):
         rpc.rpc_sync(f"worker{rank}", _signal_stop, args=())
-
     rpc.shutdown()
 
 
-# ----------------------------
-# Misc helpers & process entry
-# ----------------------------
-
-def _split_rows(M: int, parts: int) -> List[Tuple[int, int]]:
-    q, r = divmod(M, parts)
-    splits = []
-    start = 0
-    for p in range(parts):
-        end = start + q + (1 if p < r else 0)
-        splits.append((start, end))
-        start = end
-    return splits
-
+# --------------- Worker entry ---------------
 
 def worker_main(args, rank: int, world_size: int):
     global _STOP_EVENT
@@ -363,58 +295,47 @@ def worker_main(args, rank: int, world_size: int):
     except Exception:
         pass
 
-    rpc.init_rpc(
-        name=f"worker{rank}",
-        rank=rank,
-        world_size=world_size,
-        rpc_backend_options=opts,
-    )
+    # Pairwise device maps for CUDA-IPC among workers
+    name = f"worker{rank}"
+    for dst_rank in range(1, world_size):
+        if dst_rank == rank: continue
+        opts.set_device_map(f"worker{dst_rank}", {rank-1: dst_rank-1})
+    # Optional mapping to coordinator GPU 0 (not strictly needed here)
+    opts.set_device_map("coordinator", {rank-1: 0})
+
+    rpc.init_rpc(name=name, rank=rank, world_size=world_size, rpc_backend_options=opts)
+
+    # Create and register the instance used by static recv
+    inst = ExpertWorker(rank-1, name)
+    _WORKER_SINGLETON.set(inst)
 
     _STOP_EVENT.wait()
     rpc.shutdown()
 
 
+# ----------------- Launcher -----------------
+
 def parse_args():
-    ap = argparse.ArgumentParser(description="Single-node multi-GPU RPC: matmul or MoE-FFN")
+    ap = argparse.ArgumentParser(description="Single-node MoE P2P FFN over PyTorch RPC (coord-verify)")
     ap.add_argument("--workers", type=int, default=2, help="Number of workers (uses this many GPUs)")
-
-    # matmul task args
-    ap.add_argument("--m", type=int, default=4096)
-    ap.add_argument("--k", type=int, default=4096)
-    ap.add_argument("--n", type=int, default=4096)
-
-    # moe_ffn task args
-    ap.add_argument("--task", type=str, default="moe_ffn", choices=["matmul", "moe_ffn"], help="Which demo to run")
-    ap.add_argument("--tokens", type=int, default=8192, help="# input tokens for MoE-FFN")
-    ap.add_argument("--d-model", type=int, default=2048, help="Model dimension for MoE-FFN")
-    ap.add_argument("--d-hidden", type=int, default=4096, help="Hidden dimension for MoE-FFN")
-    ap.add_argument("--gate", type=str, default="round_robin", choices=["round_robin", "random"], help="Routing policy")
-
-    # common
-    ap.add_argument("--coordinator-gpu", type=int, default=0, help="CUDA device for coordinator")
+    ap.add_argument("--tokens", type=int, default=2048, help="Tokens initialized per worker (on GPU)")
+    ap.add_argument("--d-model", type=int, default=1024, help="Model dimension")
+    ap.add_argument("--d-hidden", type=int, default=4096, help="Hidden dimension")
+    ap.add_argument("--gate", type=str, default="random", choices=["round_robin", "random"], help="Routing policy per worker")
+    ap.add_argument("--verify", type=str, default="coord_gpu", choices=["none", "coord_gpu", "coord_cpu1"], help="Verification on coordinator")
+    ap.add_argument("--coordinator-gpu", type=int, default=0, help="Coordinator GPU (for param broadcast and coord_gpu verify)")
     ap.add_argument("--rpc-threads", type=int, default=128, help="RPC worker threads")
-    ap.add_argument("--init", type=str, default="tcp://127.0.0.1:29500", help="RPC init_method URL")
-    ap.add_argument("--verify", type=str, default="gpu", choices=["none", "gpu", "cpu1"],
-                    help="Verification: none | gpu (baseline on coordinator) | cpu1 (single-thread CPU)")
+    ap.add_argument("--init", type=str, default="tcp://127.0.0.1:29560", help="RPC init_method URL")
     return ap.parse_args()
 
 
 def main():
     args = parse_args()
-
     assert torch.cuda.is_available(), "CUDA is required"
-    n_devices = torch.cuda.device_count()
-    assert args.workers <= n_devices, f"Need >= {args.workers} visible GPUs (have {n_devices})"
-
+    ndev = torch.cuda.device_count()
+    assert args.workers <= ndev, f"Need >= {args.workers} visible GPUs (have {ndev})"
     world_size = 1 + args.workers
-
-    mp.spawn(
-        fn=_entry,
-        args=(args, world_size),
-        nprocs=world_size,
-        join=True,
-        daemon=False,
-    )
+    mp.spawn(fn=_entry, args=(args, world_size), nprocs=world_size, join=True, daemon=False)
 
 
 def _entry(rank: int, args, world_size: int):
@@ -426,9 +347,3 @@ def _entry(rank: int, args, world_size: int):
 
 if __name__ == "__main__":
     main()
-
-
-"""
-python rpc_moe_p2p_ffn_v2.py --workers 4 --tokens 4096 \
-  --d-model 1024 --d-hidden 4096 --gate random --verify coord_gpu
-"""
