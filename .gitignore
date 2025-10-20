@@ -208,3 +208,6 @@ __marimo__/
 
 results/*
 *.png
+
+output/*
+output*
