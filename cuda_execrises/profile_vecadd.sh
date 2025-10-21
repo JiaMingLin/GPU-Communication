@@ -1,22 +1,34 @@
 #!/bin/bash
 # ==========================================
-# CUDA Profiling Script for vecAdd
+# CUDA Profiling Script for Multiple Programs
 # ==========================================
 # Usage:
-#   ./profile_vecadd.sh orin
-#   ./profile_vecadd.sh rtx
+#   ./profile_vecadd.sh vecAdd orin
+#   ./profile_vecadd.sh grayscale rtx
+#   ./profile_vecadd.sh vecAdd rtx    (default)
 #
 # All build and profiling outputs will be stored in ./output/
 # ==========================================
 
 set -e  # stop on first error
 
-TARGET=${1:-rtx}   # default = RTX
-SRC="vecAdd.cu"
-APP="vecAdd"
-THREADS=256
+APP=${1:-vecAdd}   # default = vecAdd
+TARGET=${2:-rtx}    # default = RTX
 PROFILE_TAG=$(date +"%Y%m%d_%H%M")
 OUTDIR="output"
+
+# ---------- Select source file based on app ----------
+if [ "$APP" == "vecAdd" ]; then
+    SRC="vecAdd.cu"
+    KERNEL_NAME="vecAddKernel"
+elif [ "$APP" == "grayscale" ]; then
+    SRC="grayscale.cu"
+    KERNEL_NAME="grayscaleKernel"
+else
+    echo "[ERROR] Unknown app: $APP"
+    echo "Usage: ./profile_vecadd.sh [vecAdd|grayscale] [orin|rtx]"
+    exit 1
+fi
 
 mkdir -p "$OUTDIR"
 
@@ -31,14 +43,21 @@ elif [ "$TARGET" == "rtx" ]; then
     EXTRA_FLAGS="--gpu-architecture=compute_86"
 else
     echo "[ERROR] Unknown target: $TARGET"
-    echo "Usage: ./profile_vecadd.sh [orin|rtx]"
+    echo "Usage: ./profile_vecadd.sh [vecAdd|grayscale] [orin|rtx]"
     exit 1
 fi
 
 # ---------- Compile ----------
-echo "[BUILD] Compiling for $ARCH ..."
-nvcc $SRC -o "${OUTDIR}/${APP}_${TARGET}" \
-    -std=c++17 -O3 -lineinfo -arch=$ARCH -Xptxas -v $EXTRA_FLAGS
+echo "[BUILD] Compiling $SRC for $ARCH ..."
+if [ "$APP" == "grayscale" ]; then
+    # For grayscale, STB headers are now in the same directory
+    nvcc $SRC -o "${OUTDIR}/${APP}_${TARGET}" \
+        -std=c++17 -O3 -lineinfo -arch=$ARCH -Xptxas -v $EXTRA_FLAGS \
+        -lcudart
+else
+    nvcc $SRC -o "${OUTDIR}/${APP}_${TARGET}" \
+        -std=c++17 -O3 -lineinfo -arch=$ARCH -Xptxas -v $EXTRA_FLAGS
+fi
 
 # ---------- Run correctness test ----------
 echo "[RUN] Running compute-sanitizer ..."
@@ -52,7 +71,7 @@ nsys stats "${OUTDIR}/${APP}_${TARGET}_${PROFILE_TAG}_sys.nsys-rep" > "${OUTDIR}
 
 # ---------- Nsight Compute (kernel micro-analysis) ----------
 echo "[PROFILE] Running Nsight Compute ..."
-ncu --set full --kernel-name "vecAddKernel" \
+ncu --set full --kernel-name "$KERNEL_NAME" \
     --export "${OUTDIR}/${APP}_${TARGET}_${PROFILE_TAG}_ncu" \
     "${OUTDIR}/${APP}_${TARGET}"
 
