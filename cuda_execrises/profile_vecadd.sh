@@ -5,6 +5,7 @@
 # Usage:
 #   ./profile_vecadd.sh vecAdd orin
 #   ./profile_vecadd.sh grayscale rtx
+#   ./profile_vecadd.sh image_blur rtx
 #   ./profile_vecadd.sh vecAdd rtx    (default)
 #
 # All build and profiling outputs will be stored in ./output/
@@ -24,9 +25,12 @@ if [ "$APP" == "vecAdd" ]; then
 elif [ "$APP" == "grayscale" ]; then
     SRC="grayscale.cu"
     KERNEL_NAME="grayscaleKernel"
+elif [ "$APP" == "image_blur" ]; then
+    SRC="image_blur.cu"
+    KERNEL_NAME="blurImageKernel"
 else
     echo "[ERROR] Unknown app: $APP"
-    echo "Usage: ./profile_vecadd.sh [vecAdd|grayscale] [orin|rtx]"
+    echo "Usage: ./profile_vecadd.sh [vecAdd|grayscale|image_blur] [orin|rtx]"
     exit 1
 fi
 
@@ -43,14 +47,14 @@ elif [ "$TARGET" == "rtx" ]; then
     EXTRA_FLAGS="--gpu-architecture=compute_86"
 else
     echo "[ERROR] Unknown target: $TARGET"
-    echo "Usage: ./profile_vecadd.sh [vecAdd|grayscale] [orin|rtx]"
+    echo "Usage: ./profile_vecadd.sh [vecAdd|grayscale|image_blur] [orin|rtx]"
     exit 1
 fi
 
 # ---------- Compile ----------
 echo "[BUILD] Compiling $SRC for $ARCH ..."
-if [ "$APP" == "grayscale" ]; then
-    # For grayscale, STB headers are now in the same directory
+if [ "$APP" == "grayscale" ] || [ "$APP" == "image_blur" ]; then
+    # For grayscale and image_blur, STB headers are in the same directory
     nvcc $SRC -o "${OUTDIR}/${APP}_${TARGET}" \
         -std=c++17 -O3 -lineinfo -arch=$ARCH -Xptxas -v $EXTRA_FLAGS \
         -lcudart
