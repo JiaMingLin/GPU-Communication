@@ -68,7 +68,7 @@ def stats_capacity(n: torch.Tensor, cap: int) -> Tuple[int, int, int]:
 # ---------- main ----------
 def main():
     ap = argparse.ArgumentParser(description="Benchmark MoE padding strategies with Zipf routing.")
-    ap.add_argument("--N", type=int, default=8192, help="number of tokens")
+    ap.add_argument("--N", type=int, default=1024, help="number of tokens")
     ap.add_argument("--E", type=int, default=16, help="number of experts")
     ap.add_argument("--d", type=int, default=1024, help="model dim")
     ap.add_argument("--dff", type=int, default=4096, help="FFN hidden dim")
