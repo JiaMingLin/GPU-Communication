@@ -146,8 +146,8 @@ def time_cpu_ms(fn, warmup=2, repeats=20):
 # --------------------------
 def main():
     ap = argparse.ArgumentParser(description="Loop vs Vectorized copy (one-time grouping, warmup+repeats).")
-    ap.add_argument("--N", type=int, default=8192)
-    ap.add_argument("--E", type=int, default=16)
+    ap.add_argument("--N", type=int, default=2048)
+    ap.add_argument("--E", type=int, default=4)
     ap.add_argument("--d", type=int, default=1024)
     ap.add_argument("--cap", type=int, default=512)
     ap.add_argument("--device", type=str, default="cuda", choices=["cuda","cpu"])
@@ -165,6 +165,7 @@ def main():
 
     # 建資料
     N, E, d, cap = args.N, args.E, args.d, args.cap
+    cap = N // E
     X = torch.randn(N, d, device=dev, dtype=dtype)
 
     # Zipf routing（同一份）

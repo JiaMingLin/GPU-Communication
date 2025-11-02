@@ -80,8 +80,8 @@ def moe_forward_packed(
 if __name__ == "__main__":
     import argparse
     
-    # 從 benchmark_moe_padding.py 導入 Zipf 路由函數
-    from benchmark_moe_padding import zipf_probs, sample_zipf_routing
+    # 從 benchmark_moe_padding.py 導入 Zipf 路由函數和設置函數
+    from benchmark_moe_padding import zipf_probs, sample_zipf_routing, set_matmul_flags
     # 從 metrics_profiling.py 導入量測工具
     from metrics_profiling import Metrics, Profiling
     
@@ -92,27 +92,43 @@ if __name__ == "__main__":
     parser.add_argument("--E", type=int, default=4, help="Expert 數量")
     parser.add_argument("--alpha", type=float, default=1.2, help="Zipf alpha (0=uniform, bigger=more skew)")
     parser.add_argument("--activation", type=str, default="gelu", choices=["gelu", "relu"], help="激活函數")
-    parser.add_argument("--group_same_n", action="store_true", help="啟用相同 n 的 batched BMM")
+    parser.add_argument("--no-group_same_n", action="store_false", dest="group_same_n", default=True, help="停用相同 n 的 batched BMM (預設啟用)")
     parser.add_argument("--seed", type=int, default=42, help="隨機種子")
     parser.add_argument("--repeats", type=int, default=100, help="重複測試次數")
     parser.add_argument("--profile", action="store_true", help="啟用詳細時間量測")
+    parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"], help="計算設備")
+    parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "fp32"], help="數據類型")
     
     args = parser.parse_args()
     
     # 設定隨機種子
     torch.manual_seed(args.seed)
     
-    # 生成測試數據
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"生成測試數據: N={args.N}, d={args.d}, dff={args.dff}, E={args.E}, alpha={args.alpha}, device={device}")
-    X = torch.randn(args.N, args.d, device=device, dtype=torch.float32)
+    # 設定設備和數據類型
+    if args.device == "cuda" and not torch.cuda.is_available():
+        print("[warn] CUDA 不可用，自動改用 CPU")
+        args.device = "cpu"
+    device = torch.device(args.device)
+    
+    if args.dtype == "fp16":
+        dtype = torch.float16
+    elif args.dtype == "bf16":
+        dtype = torch.bfloat16
+    else:
+        dtype = torch.float32
+    
+    # 設定矩陣乘法優化標誌（與 benchmark_moe_padding.py 一致）
+    set_matmul_flags()
+    
+    print(f"生成測試數據: N={args.N}, d={args.d}, dff={args.dff}, E={args.E}, alpha={args.alpha}, device={device}, dtype={args.dtype}")
+    X = torch.randn(args.N, args.d, device=device, dtype=dtype)
     
     # 使用 Zipf 分佈生成 expert 索引
     expert_idx = sample_zipf_routing(args.N, args.E, args.alpha, device=device)
     
     # 生成權重矩陣
-    W1 = torch.randn(args.E, args.d, args.dff, device=device, dtype=torch.float32)
-    W2 = torch.randn(args.E, args.dff, args.d, device=device, dtype=torch.float32)
+    W1 = torch.randn(args.E, args.d, args.dff, device=device, dtype=dtype)
+    W2 = torch.randn(args.E, args.dff, args.d, device=device, dtype=dtype)
     
     # 顯示 Expert 分配
     counts = torch.bincount(expert_idx, minlength=args.E)
@@ -139,8 +155,8 @@ if __name__ == "__main__":
         
         print(f"\n開始量測 ({args.repeats} 次重複)...")
         
-        # 暖機
-        for _ in range(3):
+        # 暖機（與 benchmark_moe_padding.py 一致，使用 5 次）
+        for _ in range(5):
             _ = moe_forward_packed(X, expert_idx, W1, W2, activation=args.activation, group_same_n=args.group_same_n)
         
         if device.type == "cuda":

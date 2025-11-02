@@ -19,8 +19,8 @@ $ python bench_batch_vs_seq_gemm.py --device cuda --M 1024 --K 1024 --N 1024 \
 Jetson Orin NX
 $ sudo nvpmodel -m 0
 $ sudo jetson_clocks
-$ python3 bench_batch_vs_seq_gemm.py --device cuda --M 512 --K 512 --N 512 \
-    --batches 1 2 4 8 16 --dtype fp16 --repeats 3 --warmup 2 \
+$ python3 bench_batch_vs_seq_gemm.py --device cuda --M 4096 --K 4096 --N 4096 \
+    --batches 1 2 4 8 16 --dtype fp16 --repeats 100 --warmup 2 \
     --timing gpu --energy tegrastats --tegrastats-keys VDD_IN \
     --energy-interval-ms 10 --min-energy-window-ms 1000 \
     --out result_orin_vddin.csv
