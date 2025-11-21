@@ -110,6 +110,81 @@ def build_xcap_vectorized(
     return Xcap
 
 # --------------------------
+# 方法 C：pad_grouped_to_cap_fast（從 fast_build_xcap.py 移植）
+# --------------------------
+@torch.inference_mode()
+def pad_grouped_to_cap_fast(
+    X_grouped: torch.Tensor,      # [N, d]，已經是依 expert 排好且連續
+    counts: torch.Tensor,         # [E]，每個 expert 的 token 數
+    off: torch.Tensor,            # [E+1]，prefix-sum，X_grouped[off[e]:off[e+1]] 是第 e 個 expert
+    cap: int,                     # capacity
+    xcap_workspace: torch.Tensor = None,  # 可選，預先配置好的 [E, cap, d] 工作區
+) -> torch.Tensor:
+    """
+    回傳 Xcap: [E, cap, d]；只清 pad 尾端；全程 GPU。
+    需求：X_grouped, counts, off 同在 CUDA，且 X_grouped.contiguous()
+    """
+    assert X_grouped.is_cuda and counts.is_cuda and off.is_cuda
+    assert X_grouped.is_contiguous(), "X_grouped 請先 .contiguous()"
+    device = X_grouped.device
+    E = counts.numel()
+    d = X_grouped.shape[1]
+    kept = torch.clamp(counts, max=cap)                     # [E] int
+    N = int(counts.sum().item())                            # 只在這裡取一次 N（不會影響正確性）
+                                                            # 若要 100% 避免同步，傳入 N 也可。
+
+    # 1) 工作區（不清零）
+    if xcap_workspace is None or xcap_workspace.numel() == 0 \
+       or xcap_workspace.shape != (E, cap, d) \
+       or xcap_workspace.dtype != X_grouped.dtype \
+       or xcap_workspace.device != device:
+        Xcap = torch.empty((E, cap, d), device=device, dtype=X_grouped.dtype)
+    else:
+        Xcap = xcap_workspace
+
+    # 2) 建立目的地/來源索引（GPU）
+    # 需要拷入的 rows：對每個 expert，row in [0, kept[e])
+    rows = torch.arange(cap, device=device, dtype=kept.dtype)                # [cap]
+    mask = rows.unsqueeze(0) < kept.unsqueeze(1)                             # [E, cap] bool
+    e_idx, r_idx = torch.nonzero(mask, as_tuple=True)                        # [M], [M] where M = kept.sum()
+
+    # src = off[e] + r
+    base = off[:-1]                                                          # [E]
+    src_idx = base.gather(0, e_idx) + r_idx                                  # [M] in X_grouped
+    # dst = e*cap + r  (在扁平化後的 [E*cap, d] 中的 row)
+    dst_idx = e_idx * cap + r_idx                                            # [M]
+
+    # 3) 扁平視圖，一次性搬運（read N rows, write N rows）
+    Xcap_flat = Xcap.view(E * cap, d)
+    # 等價於：Xcap_flat[dst_idx] = X_grouped.index_select(0, src_idx)
+    Xcap_flat.index_copy_(0, dst_idx, X_grouped.index_select(0, src_idx))
+
+    # 4) 僅清 pad 尾端（寫 (E*cap - N) rows；避免整塊 new_zeros）
+    if mask.numel() != E * cap:   # 防守式；實際上一定成立
+        pass
+    # pad rows 的位置：~mask
+    pad_e, pad_r = torch.nonzero(~mask, as_tuple=True)
+    if pad_e.numel() > 0:
+        pad_dst = pad_e * cap + pad_r
+        # 針對 row 維度做 index_fill_，整 row 置零；單一 kernel，寫入量 = pad_rows * d
+        Xcap_flat.index_fill_(0, pad_dst, 0)
+
+    return Xcap
+
+@torch.inference_mode()
+def build_xcap_fast(
+    X: torch.Tensor, E: int, cap: int,
+    order: torch.Tensor, counts: torch.Tensor, off: torch.Tensor,
+    xcap_workspace: torch.Tensor = None
+) -> torch.Tensor:
+    """
+    包裝 pad_grouped_to_cap_fast，使其與其他 build_xcap_* 函數具有相同的接口。
+    輸出：Xcap ∈ [E, cap, d]
+    """
+    Xg = X[order].contiguous()  # 確保連續
+    return pad_grouped_to_cap_fast(Xg, counts, off, cap, xcap_workspace)
+
+# --------------------------
 # 量測工具
 # --------------------------
 def time_cuda_ms(fn, warmup=5, repeats=50):
@@ -178,18 +253,49 @@ def main():
     # 只呼叫一次 grouping，兩方法共用
     order, counts, off = make_grouping(expert_idx, E)
 
+    # 計算統計信息：padding 和 dropped rows
+    kept = torch.clamp(counts, max=cap)  # [E] 每個 expert 保留的 rows
+    dropped = counts - kept  # [E] 每個 expert 被 dropped 的 rows（可能為負，取 max(0)）
+    total_dropped = int((dropped.clamp(min=0)).sum().item())  # 總共被 dropped 的 rows
+    total_kept = int(kept.sum().item())  # 總共保留的 rows
+    total_padded = E * cap - total_kept  # padding 後的總 rows 減去保留的 = padding 的 rows
+    total_after_padding = E * cap  # padding 後的總 rows
+    
+    # 顯示統計信息
+    print(f"\n[Statistics]")
+    print(f"  Original rows (N): {N}")
+    print(f"  Rows kept: {total_kept} (after clamping to cap={cap})")
+    print(f"  Rows dropped: {total_dropped} (超過 capacity 的部分)")
+    print(f"  Rows padded: {total_padded} (填充的零 rows)")
+    print(f"  Total rows after padding: {total_after_padding} (= E * cap = {E} * {cap})")
+    if total_dropped > 0:
+        print(f"  Drop rate: {100.0 * total_dropped / N:.2f}%")
+    print(f"  Padding rate: {100.0 * total_padded / total_after_padding:.2f}%")
+
     # 先做一次輸出並驗證一致
     Xcap_loop_item = build_xcap_loop_with_item(X, E, cap, order, counts, off)
     Xcap_loop = build_xcap_loop(X, E, cap, order, counts, off)
     Xcap_vec  = build_xcap_vectorized(X, E, cap, order, counts, off)
     
-    # 驗證三種方法輸出相同
+    # 對於 fast 版本，需要 CUDA 且預先準備 workspace
+    if use_cuda:
+        xcap_workspace = torch.empty((E, cap, d), device=dev, dtype=dtype)
+        Xcap_fast = build_xcap_fast(X, E, cap, order, counts, off, xcap_workspace)
+    else:
+        Xcap_fast = None
+    
+    # 驗證所有方法輸出相同
     same_1 = torch.equal(Xcap_loop_item, Xcap_loop)
     same_2 = torch.equal(Xcap_loop, Xcap_vec)
     max_abs_1 = (Xcap_loop_item - Xcap_loop).abs().max().item()
     max_abs_2 = (Xcap_loop - Xcap_vec).abs().max().item()
     print(f"[Equal] loop_with_item vs loop: {same_1} | max_abs_diff = {max_abs_1:.3e}")
     print(f"[Equal] loop vs vectorized: {same_2} | max_abs_diff = {max_abs_2:.3e}")
+    
+    if use_cuda and Xcap_fast is not None:
+        same_3 = torch.equal(Xcap_vec, Xcap_fast)
+        max_abs_3 = (Xcap_vec - Xcap_fast).abs().max().item()
+        print(f"[Equal] vectorized vs fast: {same_3} | max_abs_diff = {max_abs_3:.3e}")
 
     # 量測
     if use_cuda:
@@ -199,6 +305,10 @@ def main():
                                       warmup=args.warmup, repeats=args.repeats)
         avg_vec_ms,  _ = time_cuda_ms(lambda: build_xcap_vectorized(X, E, cap, order, counts, off),
                                       warmup=args.warmup, repeats=args.repeats)
+        # fast 版本需要 workspace（可重用）
+        xcap_workspace = torch.empty((E, cap, d), device=dev, dtype=dtype)
+        avg_fast_ms, _ = time_cuda_ms(lambda: build_xcap_fast(X, E, cap, order, counts, off, xcap_workspace),
+                                      warmup=args.warmup, repeats=args.repeats)
     else:
         avg_loop_item_ms, _ = time_cpu_ms(lambda: build_xcap_loop_with_item(X, E, cap, order, counts, off),
                                            warmup=args.warmup, repeats=args.repeats)
@@ -206,12 +316,15 @@ def main():
                                      warmup=args.warmup, repeats=args.repeats)
         avg_vec_ms,  _ = time_cpu_ms(lambda: build_xcap_vectorized(X, E, cap, order, counts, off),
                                      warmup=args.warmup, repeats=args.repeats)
+        avg_fast_ms = None
 
     print(f"[Setting] N={N}, E={E}, d={d}, cap={cap}, device={dev}, dtype={dtype}")
     print(f"[Timing] (warmup={args.warmup}, repeats={args.repeats})")
     print(f"  loop_with_item:  {avg_loop_item_ms:.3f} ms  (使用 .item()，會造成 CPU-GPU 同步)")
     print(f"  loop:            {avg_loop_ms:.3f} ms  (避免 .item()，先轉 CPU)")
     print(f"  vectorized:      {avg_vec_ms:.3f} ms  (向量化版本)")
+    if use_cuda and avg_fast_ms is not None:
+        print(f"  fast:            {avg_fast_ms:.3f} ms  (pad_grouped_to_cap_fast 版本)")
     
     # 計算加速比
     if avg_loop_item_ms > 0:
@@ -220,6 +333,12 @@ def main():
     if avg_loop_ms > 0:
         speedup_vec_vs_loop = avg_loop_ms / avg_vec_ms
         print(f"[Speedup] vectorized 相對 loop: {speedup_vec_vs_loop:.2f}x")
+    if use_cuda and avg_fast_ms is not None and avg_vec_ms > 0:
+        speedup_fast_vs_vec = avg_vec_ms / avg_fast_ms
+        print(f"[Speedup] fast 相對 vectorized: {speedup_fast_vs_vec:.2f}x")
+    if use_cuda and avg_fast_ms is not None and avg_loop_ms > 0:
+        speedup_fast_vs_loop = avg_loop_ms / avg_fast_ms
+        print(f"[Speedup] fast 相對 loop: {speedup_fast_vs_loop:.2f}x")
 
 if __name__ == "__main__":
     main()

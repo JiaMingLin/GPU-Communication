@@ -438,73 +438,134 @@ int main(int argc, char** argv) {
   cout << "  output blocks: " << num_blocks << " blocks of size [" << ky << ", " << kx << "]\n";
   cout << "  資料生成耗時: " << fixed << setprecision(3) << t_gen_data.ms << " ms\n\n";
 
-  // 5) GPU 完整流程（包含記憶體管理與拷貝）的時間計測
-  TimeMs t_gpu_total;
-  vector<float> val = with_timer(t_gpu_total, [&]() {
-    const int num_block_rows = (int)blk_row_ptr.size() - 1;
-    const size_t A_bytes = (size_t)M * d * sizeof(float);
-    const size_t B_bytes = (size_t)N * d * sizeof(float);
-    const size_t rowptr_bytes = (size_t)(num_block_rows + 1) * sizeof(int);
-    const size_t colind_bytes = (size_t)num_blocks * sizeof(int);
-    const size_t val_bytes = (size_t)num_blocks * ky * kx * sizeof(float);
+  // 5) GPU 計算（記憶體操作與 kernel 時間分離測量）
+  const int num_block_rows = (int)blk_row_ptr.size() - 1;
+  const size_t A_bytes = (size_t)M * d * sizeof(float);
+  const size_t B_bytes = (size_t)N * d * sizeof(float);
+  const size_t rowptr_bytes = (size_t)(num_block_rows + 1) * sizeof(int);
+  const size_t colind_bytes = (size_t)num_blocks * sizeof(int);
+  const size_t val_bytes = (size_t)num_blocks * ky * kx * sizeof(float);
 
-    float *A_d=nullptr, *B_d=nullptr, *val_d=nullptr;
-    int *rowptr_d=nullptr, *colind_d=nullptr;
-    CHECK_CUDA(cudaMalloc(&A_d, A_bytes));
-    CHECK_CUDA(cudaMalloc(&B_d, B_bytes));
-    CHECK_CUDA(cudaMalloc(&rowptr_d, rowptr_bytes));
-    CHECK_CUDA(cudaMalloc(&colind_d, colind_bytes));
-    CHECK_CUDA(cudaMalloc(&val_d, val_bytes));
+  float *A_d=nullptr, *B_d=nullptr, *val_d=nullptr;
+  int *rowptr_d=nullptr, *colind_d=nullptr;
+  CHECK_CUDA(cudaMalloc(&A_d, A_bytes));
+  CHECK_CUDA(cudaMalloc(&B_d, B_bytes));
+  CHECK_CUDA(cudaMalloc(&rowptr_d, rowptr_bytes));
+  CHECK_CUDA(cudaMalloc(&colind_d, colind_bytes));
+  CHECK_CUDA(cudaMalloc(&val_d, val_bytes));
 
-    CHECK_CUDA(cudaMemcpy(A_d, AB.A.data(), A_bytes, cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(B_d, AB.B.data(), B_bytes, cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(rowptr_d, blk_row_ptr.data(), rowptr_bytes, cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(colind_d, blk_col_ind.data(), colind_bytes, cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(A_d, AB.A.data(), A_bytes, cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(B_d, AB.B.data(), B_bytes, cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(rowptr_d, blk_row_ptr.data(), rowptr_bytes, cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(colind_d, blk_col_ind.data(), colind_bytes, cudaMemcpyHostToDevice));
 
-    // 啟動 Kernel（注意：blockDim = (ky, kx) 
-    //   → threadIdx.x 對應 row [0, ky)，threadIdx.y 對應 column [0, kx)）
-    dim3 blockDim(ky, kx);
-    dim3 gridDim(num_blocks);
+  // Kernel 啟動參數
+  dim3 blockDim(ky, kx);
+  dim3 gridDim(num_blocks);
+
+  // Warm up: 先執行一次 kernel
+  spmm_block_kernel_rect_final<<<gridDim, blockDim>>>(
+      A_d, B_d, rowptr_d, colind_d, val_d, d, ky, kx, num_block_rows);
+  CHECK_CUDA(cudaDeviceSynchronize());
+
+  // 使用 CUDA events 測量 kernel 執行時間（多次執行取平均）
+  const int num_iterations = 100;  // 執行次數
+  cudaEvent_t start_event, stop_event;
+  CHECK_CUDA(cudaEventCreate(&start_event));
+  CHECK_CUDA(cudaEventCreate(&stop_event));
+
+  vector<float> kernel_times;
+  kernel_times.reserve(num_iterations);
+
+  for (int iter = 0; iter < num_iterations; ++iter) {
+    CHECK_CUDA(cudaEventRecord(start_event));
     spmm_block_kernel_rect_final<<<gridDim, blockDim>>>(
         A_d, B_d, rowptr_d, colind_d, val_d, d, ky, kx, num_block_rows);
-    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaEventRecord(stop_event));
+    CHECK_CUDA(cudaEventSynchronize(stop_event));
+    
+    float elapsed_ms = 0.0f;
+    CHECK_CUDA(cudaEventElapsedTime(&elapsed_ms, start_event, stop_event));
+    kernel_times.push_back(elapsed_ms);
+  }
 
-    // 取回 val
-    vector<float> val_result(num_blocks * ky * kx);
-    CHECK_CUDA(cudaMemcpy(val_result.data(), val_d, val_bytes, cudaMemcpyDeviceToHost));
-    
-    // 釋放記憶體
-    cudaFree(A_d);
-    cudaFree(B_d);
-    cudaFree(rowptr_d);
-    cudaFree(colind_d);
-    cudaFree(val_d);
-    
-    return val_result;
-  });
+  // 計算平均時間
+  double avg_kernel_time = 0.0;
+  for (float t : kernel_times) avg_kernel_time += t;
+  avg_kernel_time /= num_iterations;
+
+  TimeMs t_gpu_kernel;
+  t_gpu_kernel.ms = avg_kernel_time;
+
+  // 取回結果
+  vector<float> val(num_blocks * ky * kx);
+  CHECK_CUDA(cudaMemcpy(val.data(), val_d, val_bytes, cudaMemcpyDeviceToHost));
+  
+  // 清理 CUDA events
+  CHECK_CUDA(cudaEventDestroy(start_event));
+  CHECK_CUDA(cudaEventDestroy(stop_event));
+  
+  // 釋放記憶體
+  cudaFree(A_d);
+  cudaFree(B_d);
+  cudaFree(rowptr_d);
+  cudaFree(colind_d);
+  cudaFree(val_d);
 
   // 6) GPU 時間報告
   cout << "\n=== GPU 計算完成 ===\n";
-  cout << "總耗時（含資料搬移）: " << fixed << setprecision(3) << t_gpu_total.ms << " ms\n";
+  cout << "Kernel 執行時間（平均 " << num_iterations << " 次）: " 
+       << fixed << setprecision(3) << t_gpu_kernel.ms << " ms\n";
   cout << "  val.size() = " << val.size() << " (= " << num_blocks << " blocks × " 
        << ky << " × " << kx << ")\n";
 
-  // 7) CPU 參考計算與驗證
+  // 7) CPU 參考計算與驗證（包含暖機和多次執行取平均）
   cout << "\n=== CPU 參考計算 ===\n";
-  TimeMs t_cpu;
-  auto val_cpu = with_timer(t_cpu, [&]() {
-    // 轉換 blk_row_ptr 和 blk_col_ind 為 int32_t 陣列
-    vector<int32_t> blk_row_ptr_32(blk_row_ptr.begin(), blk_row_ptr.end());
-    vector<int32_t> blk_col_ind_32(blk_col_ind.begin(), blk_col_ind.end());
-    
+  
+  // 準備輸入資料（只需要轉換一次）
+  vector<int32_t> blk_row_ptr_32(blk_row_ptr.begin(), blk_row_ptr.end());
+  vector<int32_t> blk_col_ind_32(blk_col_ind.begin(), blk_col_ind.end());
+  
+  // 定義計算函數
+  auto cpu_compute_fn = [&]() {
     return denseXdense_to_blockedSparse_values<float>(
         AB.A.data(), M, d,
         AB.B.data(), N,
         blk_row_ptr_32.data(), blk_col_ind_32.data(),
         ky, kx);
-  });
+  };
   
-  cout << "總耗時: " << fixed << setprecision(3) << t_cpu.ms << " ms\n";
+  // Warm-up: 先執行一次
+  auto val_cpu_warmup = cpu_compute_fn();
+  
+  // 多次執行並測量時間（與 GPU 使用相同的執行次數）
+  const int num_iterations_cpu = num_iterations;
+  vector<double> cpu_times;
+  cpu_times.reserve(num_iterations_cpu);
+  
+  for (int iter = 0; iter < num_iterations_cpu; ++iter) {
+    auto beg = chrono::steady_clock::now();
+    auto result = cpu_compute_fn();
+    auto end = chrono::steady_clock::now();
+    double elapsed_ms = chrono::duration<double, milli>(end - beg).count();
+    cpu_times.push_back(elapsed_ms);
+    // 只在最後一次保留結果用於驗證
+    if (iter == num_iterations_cpu - 1) {
+      val_cpu_warmup = std::move(result);
+    }
+  }
+  
+  // 計算平均時間
+  double avg_cpu_time = 0.0;
+  for (double t : cpu_times) avg_cpu_time += t;
+  avg_cpu_time /= num_iterations_cpu;
+  
+  TimeMs t_cpu;
+  t_cpu.ms = avg_cpu_time;
+  auto val_cpu = std::move(val_cpu_warmup);
+  
+  cout << "總耗時（平均 " << num_iterations_cpu << " 次）: " 
+       << fixed << setprecision(3) << t_cpu.ms << " ms\n";
   cout << "  val_cpu.size() = " << val_cpu.size() 
        << " (預期 " << num_blocks * ky * kx << ")\n";
   
@@ -559,10 +620,12 @@ int main(int argc, char** argv) {
 
   // 8) 時間比較總結
   cout << "\n=== 效能比較 ===\n";
-  cout << "  GPU 總時間: " << fixed << setprecision(3) << t_gpu_total.ms << " ms\n";
-  cout << "  CPU 總時間: " << fixed << setprecision(3) << t_cpu.ms << " ms\n";
+  cout << "  GPU Kernel 時間（" << num_iterations << " 次平均）: " 
+       << fixed << setprecision(3) << t_gpu_kernel.ms << " ms\n";
+  cout << "  CPU 執行時間（" << num_iterations_cpu << " 次平均）: " 
+       << fixed << setprecision(3) << t_cpu.ms << " ms\n";
   if (t_cpu.ms > 0) {
-    double speedup = t_cpu.ms / t_gpu_total.ms;
+    double speedup = t_cpu.ms / t_gpu_kernel.ms;
     cout << "  加速比: " << fixed << setprecision(2) << speedup << "x\n";
   }
 

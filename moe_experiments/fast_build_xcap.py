@@ -162,4 +162,4 @@ def example(E: int = 4, N: int = 2048, d: int = 1024, zipf_alpha: float = 1.2, s
 
 # example()
 if __name__ == "__main__":
-    example(E=4, N=2048, d=1024, zipf_alpha=1.2, seed=0)
+    example(E=16, N=2048, d=1024, zipf_alpha=1.2, seed=0)

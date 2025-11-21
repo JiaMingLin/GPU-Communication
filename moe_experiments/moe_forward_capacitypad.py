@@ -148,23 +148,54 @@ def build_xcap_vectorized(
     E = n_keep.shape[0]
     d = Xgrouped.shape[1]
     
-    # Xg = X[order]                               # [N, d]
-    Xcap = Xgrouped.new_full((E, cap, d), fill_value=pad_value)
-    Xcap_flat = Xcap.view(E * cap, d)
-
-    if int(n_keep.sum().item()) == 0:
-        return Xcap  # 所有 expert 都沒有 token
-
-    row = torch.arange(cap, device=Xgrouped.device, dtype=torch.int32)         # [cap]
-    mask = row.unsqueeze(0) < n_keep.unsqueeze(1)                        # [E, cap] bool
-    e_idx, r_idx = mask.nonzero(as_tuple=True)                           # 1-D long vectors
-
-    src_idx = off[:-1][e_idx] + r_idx                                    # in Xg (len = sum kept)
-    dst_idx = (e_idx * cap + r_idx).to(torch.long)                        # in Xcap_flat
-
-    # 單次 kernel 完成所有有效行搬運
-    Xcap_flat.index_copy_(0, dst_idx, Xgrouped.index_select(0, src_idx.to(torch.long)))
-    return Xcap
+    # 優化策略：根據 pad_value 選擇最佳實現
+    # 1. pad_value == 0.0: 使用 empty + 部分清零（最快，只寫入 padding 部分）
+    # 2. pad_value != 0.0: 使用 new_full 一次性填充
+    if pad_value == 0.0:
+        # 使用 empty 避免全量初始化，然後只清零 padding 部分
+        Xcap = Xgrouped.new_empty((E, cap, d))
+        Xcap_flat = Xcap.view(E * cap, d)
+        
+        if int(n_keep.sum().item()) == 0:
+            # 所有 expert 都沒有 token，全部清零
+            Xcap.fill_(0)
+            return Xcap
+        
+        row = torch.arange(cap, device=Xgrouped.device, dtype=torch.int32)         # [cap]
+        mask = row.unsqueeze(0) < n_keep.unsqueeze(1)                        # [E, cap] bool
+        e_idx, r_idx = mask.nonzero(as_tuple=True)                           # 1-D long vectors
+        
+        src_idx = off[:-1].to(torch.long)[e_idx] + r_idx.to(torch.long)      # in Xg (len = sum kept)
+        dst_idx = (e_idx * cap + r_idx).to(torch.long)                        # in Xcap_flat
+        
+        # 先複製有效行
+        Xcap_flat.index_copy_(0, dst_idx, Xgrouped.index_select(0, src_idx))
+        
+        # 只清零 padding 部分（比全量初始化更快）
+        pad_e, pad_r = torch.nonzero(~mask, as_tuple=True)
+        if pad_e.numel() > 0:
+            pad_dst = pad_e * cap + pad_r
+            Xcap_flat.index_fill_(0, pad_dst, 0.0)
+        
+        return Xcap
+    else:
+        # 非零 pad_value：使用 new_full 一次性填充
+        Xcap = Xgrouped.new_full((E, cap, d), fill_value=pad_value)
+        Xcap_flat = Xcap.view(E * cap, d)
+        
+        if int(n_keep.sum().item()) == 0:
+            return Xcap  # 所有 expert 都沒有 token
+        
+        row = torch.arange(cap, device=Xgrouped.device, dtype=torch.int32)         # [cap]
+        mask = row.unsqueeze(0) < n_keep.unsqueeze(1)                        # [E, cap] bool
+        e_idx, r_idx = mask.nonzero(as_tuple=True)                           # 1-D long vectors
+        
+        src_idx = off[:-1].to(torch.long)[e_idx] + r_idx.to(torch.long)      # in Xg (len = sum kept)
+        dst_idx = (e_idx * cap + r_idx).to(torch.long)                        # in Xcap_flat
+        
+        # 單次 kernel 完成所有有效行搬運
+        Xcap_flat.index_copy_(0, dst_idx, Xgrouped.index_select(0, src_idx))
+        return Xcap
 
 # ---------- 小測試（可直接執行） ----------
 if __name__ == "__main__":
